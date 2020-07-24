@@ -18,13 +18,14 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.errors.StreamsException;
 import org.apache.kafka.streams.processor.TaskId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.FileFilter;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -32,7 +33,11 @@ import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.regex.Pattern;
+
+import static org.apache.kafka.streams.processor.internals.StateManagerUtil.CHECKPOINT_FILE_NAME;
 
 /**
  * Manages the directories where the state of Tasks owned by a {@link StreamThread} are
@@ -41,13 +46,17 @@ import java.util.HashMap;
  */
 public class StateDirectory {
 
-    static final String LOCK_FILE_NAME = ".lock";
+    private static final Pattern PATH_NAME = Pattern.compile("\\d+_\\d+");
     private static final Logger log = LoggerFactory.getLogger(StateDirectory.class);
+    static final String LOCK_FILE_NAME = ".lock";
 
+    private final Object taskDirCreationLock = new Object();
+    private final Time time;
+    private final String appId;
     private final File stateDir;
+    private final boolean hasPersistentStores;
     private final HashMap<TaskId, FileChannel> channels = new HashMap<>();
     private final HashMap<TaskId, LockAndOwner> locks = new HashMap<>();
-    private final Time time;
 
     private FileChannel globalStateChannel;
     private FileLock globalStateLock;
@@ -65,18 +74,27 @@ public class StateDirectory {
     /**
      * Ensures that the state base directory as well as the application's sub-directory are created.
      *
+     * @param config              streams application configuration to read the root state directory path
+     * @param time                system timer used to execute periodic cleanup procedure
+     * @param hasPersistentStores only when the application's topology does have stores persisted on local file
+     *                            system, we would go ahead and auto-create the corresponding application / task / store
+     *                            directories whenever necessary; otherwise no directories would be created.
+     *
      * @throws ProcessorStateException if the base state directory or application state directory does not exist
-     *                                 and could not be created
+     *                                 and could not be created when hasPersistentStores is enabled.
      */
-    public StateDirectory(final String applicationId, final String stateDirConfig, final Time time) {
+    public StateDirectory(final StreamsConfig config, final Time time, final boolean hasPersistentStores) {
         this.time = time;
-        final File baseDir = new File(stateDirConfig);
-        if (!baseDir.exists() && !baseDir.mkdirs()) {
+        this.hasPersistentStores = hasPersistentStores;
+        this.appId = config.getString(StreamsConfig.APPLICATION_ID_CONFIG);
+        final String stateDirName = config.getString(StreamsConfig.STATE_DIR_CONFIG);
+        final File baseDir = new File(stateDirName);
+        if (this.hasPersistentStores && !baseDir.exists() && !baseDir.mkdirs()) {
             throw new ProcessorStateException(
-                String.format("base state directory [%s] doesn't exist and couldn't be created", stateDirConfig));
+                String.format("base state directory [%s] doesn't exist and couldn't be created", stateDirName));
         }
-        stateDir = new File(baseDir, applicationId);
-        if (!stateDir.exists() && !stateDir.mkdir()) {
+        stateDir = new File(baseDir, appId);
+        if (this.hasPersistentStores && !stateDir.exists() && !stateDir.mkdir()) {
             throw new ProcessorStateException(
                 String.format("state directory [%s] doesn't exist and couldn't be created", stateDir.getPath()));
         }
@@ -87,13 +105,46 @@ public class StateDirectory {
      * @return directory for the {@link TaskId}
      * @throws ProcessorStateException if the task directory does not exists and could not be created
      */
-    File directoryForTask(final TaskId taskId) {
+    public File directoryForTask(final TaskId taskId) {
         final File taskDir = new File(stateDir, taskId.toString());
-        if (!taskDir.exists() && !taskDir.mkdir()) {
-            throw new ProcessorStateException(
-                String.format("task directory [%s] doesn't exist and couldn't be created", taskDir.getPath()));
+        if (hasPersistentStores && !taskDir.exists()) {
+            synchronized (taskDirCreationLock) {
+                // to avoid a race condition, we need to check again if the directory does not exist:
+                // otherwise, two threads might pass the outer `if` (and enter the `then` block),
+                // one blocks on `synchronized` while the other creates the directory,
+                // and the blocking one fails when trying to create it after it's unblocked
+                if (!taskDir.exists() && !taskDir.mkdir()) {
+                    throw new ProcessorStateException(
+                        String.format("task directory [%s] doesn't exist and couldn't be created", taskDir.getPath()));
+                }
+            }
         }
         return taskDir;
+    }
+
+    /**
+     * @return The File handle for the checkpoint in the given task's directory
+     */
+    File checkpointFileFor(final TaskId taskId) {
+        return new File(directoryForTask(taskId), StateManagerUtil.CHECKPOINT_FILE_NAME);
+    }
+
+    /**
+     * Decide if the directory of the task is empty or not
+     */
+    boolean directoryForTaskIsEmpty(final TaskId taskId) {
+        final File taskDir = directoryForTask(taskId);
+
+        return taskDirEmpty(taskDir);
+    }
+
+    private boolean taskDirEmpty(final File taskDir) {
+        final File[] storeDirs = taskDir.listFiles(pathname ->
+            !pathname.getName().equals(LOCK_FILE_NAME) &&
+                !pathname.getName().equals(CHECKPOINT_FILE_NAME));
+
+        // if the task is stateless, storeDirs would be null
+        return storeDirs == null || storeDirs.length == 0;
     }
 
     /**
@@ -103,7 +154,7 @@ public class StateDirectory {
      */
     File globalStateDir() {
         final File dir = new File(stateDir, "global");
-        if (!dir.exists() && !dir.mkdir()) {
+        if (hasPersistentStores && !dir.exists() && !dir.mkdir()) {
             throw new ProcessorStateException(
                 String.format("global state directory [%s] doesn't exist and couldn't be created", dir.getPath()));
         }
@@ -116,12 +167,14 @@ public class StateDirectory {
 
     /**
      * Get the lock for the {@link TaskId}s directory if it is available
-     * @param taskId
-     * @param retry
+     * @param taskId task id
      * @return true if successful
-     * @throws IOException
+     * @throws IOException if the file cannot be created or file handle cannot be grabbed, should be considered as fatal
      */
-    synchronized boolean lock(final TaskId taskId, int retry) throws IOException {
+    synchronized boolean lock(final TaskId taskId) throws IOException {
+        if (!hasPersistentStores) {
+            return true;
+        }
 
         final File lockFile;
         // we already have the lock so bail out here
@@ -136,7 +189,7 @@ public class StateDirectory {
 
         try {
             lockFile = new File(directoryForTask(taskId), LOCK_FILE_NAME);
-        } catch (ProcessorStateException e) {
+        } catch (final ProcessorStateException e) {
             // directoryForTask could be throwing an exception if another thread
             // has concurrently deleted the directory
             return false;
@@ -146,14 +199,14 @@ public class StateDirectory {
 
         try {
             channel = getOrCreateFileChannel(taskId, lockFile.toPath());
-        } catch (NoSuchFileException e) {
+        } catch (final NoSuchFileException e) {
             // FileChannel.open(..) could throw NoSuchFileException when there is another thread
             // concurrently deleting the parent directory (i.e. the directory of the taskId) of the lock
             // file, in this case we will return immediately indicating locking failed.
             return false;
         }
 
-        final FileLock lock = tryLock(retry, channel);
+        final FileLock lock = tryLock(channel);
         if (lock != null) {
             locks.put(taskId, new LockAndOwner(Thread.currentThread().getName(), lock));
 
@@ -162,7 +215,11 @@ public class StateDirectory {
         return lock != null;
     }
 
-    synchronized boolean lockGlobalState(final int retry) throws IOException {
+    synchronized boolean lockGlobalState() throws IOException {
+        if (!hasPersistentStores) {
+            return true;
+        }
+
         if (globalStateLock != null) {
             log.trace("{} Found cached state dir lock for the global task", logPrefix());
             return true;
@@ -172,13 +229,13 @@ public class StateDirectory {
         final FileChannel channel;
         try {
             channel = FileChannel.open(lockFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-        } catch (NoSuchFileException e) {
+        } catch (final NoSuchFileException e) {
             // FileChannel.open(..) could throw NoSuchFileException when there is another thread
             // concurrently deleting the parent directory (i.e. the directory of the taskId) of the lock
             // file, in this case we will return immediately indicating locking failed.
             return false;
         }
-        final FileLock fileLock = tryLock(retry, channel);
+        final FileLock fileLock = tryLock(channel);
         if (fileLock == null) {
             channel.close();
             return false;
@@ -220,6 +277,26 @@ public class StateDirectory {
         }
     }
 
+    public synchronized void clean() {
+        // remove task dirs
+        try {
+            cleanRemovedTasks(0, true);
+        } catch (final Exception e) {
+            // this is already logged within cleanRemovedTasks
+            throw new StreamsException(e);
+        }
+        // remove global dir
+        try {
+            if (stateDir.exists()) {
+                Utils.delete(globalStateDir().getAbsoluteFile());
+            }
+        } catch (final IOException e) {
+            log.error("{} Failed to delete global state directory of {} due to an unexpected exception",
+                appId, logPrefix(), e);
+            throw new StreamsException(e);
+        }
+    }
+
     /**
      * Remove the directories for any {@link TaskId}s that are no-longer
      * owned by this {@link StreamThread} and aren't locked by either
@@ -228,82 +305,118 @@ public class StateDirectory {
      *                       this amount of time (milliseconds)
      */
     public synchronized void cleanRemovedTasks(final long cleanupDelayMs) {
-        final File[] taskDirs = listTaskDirectories();
+        try {
+            cleanRemovedTasks(cleanupDelayMs, false);
+        } catch (final Exception cannotHappen) {
+            throw new IllegalStateException("Should have swallowed exception.", cannotHappen);
+        }
+    }
+
+    private synchronized void cleanRemovedTasks(final long cleanupDelayMs,
+                                                final boolean manualUserCall) throws Exception {
+        final File[] taskDirs = listAllTaskDirectories();
         if (taskDirs == null || taskDirs.length == 0) {
             return; // nothing to do
         }
-        for (File taskDir : taskDirs) {
+
+        for (final File taskDir : taskDirs) {
             final String dirName = taskDir.getName();
-            TaskId id = TaskId.parse(dirName);
+            final TaskId id = TaskId.parse(dirName);
             if (!locks.containsKey(id)) {
+                Exception exception = null;
                 try {
-                    if (lock(id, 0)) {
-                        long now = time.milliseconds();
-                        long lastModifiedMs = taskDir.lastModified();
+                    if (lock(id)) {
+                        final long now = time.milliseconds();
+                        final long lastModifiedMs = taskDir.lastModified();
                         if (now > lastModifiedMs + cleanupDelayMs) {
-                            log.info("{} Deleting obsolete state directory {} for task {} as {}ms has elapsed (cleanup delay is {}ms)", logPrefix(), dirName, id, now - lastModifiedMs, cleanupDelayMs);
-                            Utils.delete(taskDir);
+                            log.info("{} Deleting obsolete state directory {} for task {} as {}ms has elapsed (cleanup delay is {}ms).",
+                                logPrefix(), dirName, id, now - lastModifiedMs, cleanupDelayMs);
+
+                            Utils.delete(taskDir, Collections.singletonList(new File(taskDir, LOCK_FILE_NAME)));
+                        } else if (manualUserCall) {
+                            log.info("{} Deleting state directory {} for task {} as user calling cleanup.",
+                                logPrefix(), dirName, id);
+
+                            Utils.delete(taskDir, Collections.singletonList(new File(taskDir, LOCK_FILE_NAME)));
                         }
                     }
-                } catch (OverlappingFileLockException e) {
-                    // locked by another thread
-                } catch (IOException e) {
-                    log.error("{} Failed to lock the state directory due to an unexpected exception", logPrefix(), e);
+                } catch (final OverlappingFileLockException | IOException e) {
+                    exception = e;
                 } finally {
                     try {
                         unlock(id);
-                    } catch (IOException e) {
-                        log.error("{} Failed to release the state directory lock", logPrefix());
+
+                        // for manual user call, stream threads are not running so it is safe to delete
+                        // the whole directory
+                        if (manualUserCall) {
+                            Utils.delete(taskDir);
+                        }
+                    } catch (final IOException e) {
+                        exception = e;
                     }
+                }
+
+                if (exception != null && manualUserCall) {
+                    log.error("{} Failed to release the state directory lock.", logPrefix());
+                    throw exception;
                 }
             }
         }
+    }
 
+    /**
+     * List all of the task directories that are non-empty
+     * @return The list of all the non-empty local directories for stream tasks
+     */
+    File[] listNonEmptyTaskDirectories() {
+        final File[] taskDirectories;
+        if (!hasPersistentStores || !stateDir.exists()) {
+            taskDirectories = new File[0];
+        } else {
+            taskDirectories =
+                stateDir.listFiles(pathname -> {
+                    if (!pathname.isDirectory() || !PATH_NAME.matcher(pathname.getName()).matches()) {
+                        return false;
+                    } else {
+                        return !taskDirEmpty(pathname);
+                    }
+                });
+        }
+
+        return taskDirectories == null ? new File[0] : taskDirectories;
     }
 
     /**
      * List all of the task directories
      * @return The list of all the existing local directories for stream tasks
      */
-    File[] listTaskDirectories() {
-        return stateDir.listFiles(new FileFilter() {
-            @Override
-            public boolean accept(final File pathname) {
-                final String name = pathname.getName();
-                return pathname.isDirectory() && name.matches("\\d+_\\d+");
-            }
-        });
-    }
-
-    private FileLock tryLock(int retry, final FileChannel channel) throws IOException {
-        FileLock lock = tryAcquireLock(channel);
-        while (lock == null && retry > 0) {
-            try {
-                Thread.sleep(200);
-            } catch (Exception ex) {
-                // do nothing
-            }
-            retry--;
-            lock = tryAcquireLock(channel);
+    File[] listAllTaskDirectories() {
+        final File[] taskDirectories;
+        if (!hasPersistentStores || !stateDir.exists()) {
+            taskDirectories = new File[0];
+        } else {
+            taskDirectories =
+                stateDir.listFiles(pathname -> pathname.isDirectory()
+                                                   && PATH_NAME.matcher(pathname.getName()).matches());
         }
-        return lock;
+
+        return taskDirectories == null ? new File[0] : taskDirectories;
     }
 
-    private FileChannel getOrCreateFileChannel(final TaskId taskId, final Path lockPath) throws IOException {
+    private FileChannel getOrCreateFileChannel(final TaskId taskId,
+                                               final Path lockPath) throws IOException {
         if (!channels.containsKey(taskId)) {
             channels.put(taskId, FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE));
         }
         return channels.get(taskId);
     }
 
-    private FileLock tryAcquireLock(final FileChannel channel) throws IOException {
+    private FileLock tryLock(final FileChannel channel) throws IOException {
         try {
             return channel.tryLock();
-        } catch (OverlappingFileLockException e) {
+        } catch (final OverlappingFileLockException e) {
             return null;
         }
     }
-
-
 
 }

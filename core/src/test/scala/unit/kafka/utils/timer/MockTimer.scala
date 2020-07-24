@@ -20,16 +20,18 @@ import kafka.utils.MockTime
 
 import scala.collection.mutable
 
-class MockTimer extends Timer {
+class MockTimer(val time: MockTime = new MockTime) extends Timer {
 
-  val time = new MockTime
   private val taskQueue = mutable.PriorityQueue[TimerTaskEntry]()(Ordering[TimerTaskEntry].reverse)
 
-  def add(timerTask: TimerTask) {
+  def add(timerTask: TimerTask): Unit = {
     if (timerTask.delayMs <= 0)
       timerTask.run()
-    else
-      taskQueue.enqueue(new TimerTaskEntry(timerTask, timerTask.delayMs + time.milliseconds))
+    else {
+      taskQueue synchronized {
+        taskQueue.enqueue(new TimerTaskEntry(timerTask, timerTask.delayMs + time.milliseconds))
+      }
+    }
   }
 
   def advanceClock(timeoutMs: Long): Boolean = {
@@ -38,15 +40,25 @@ class MockTimer extends Timer {
     var executed = false
     val now = time.milliseconds
 
-    while (taskQueue.nonEmpty && now > taskQueue.head.expirationMs) {
-      val taskEntry = taskQueue.dequeue()
-      if (!taskEntry.cancelled) {
-        val task = taskEntry.timerTask
-        task.run()
-        executed = true
+    var hasMore = true
+    while (hasMore) {
+      hasMore = false
+      val head = taskQueue synchronized {
+        if (taskQueue.nonEmpty && now > taskQueue.head.expirationMs) {
+          val entry = Some(taskQueue.dequeue())
+          hasMore = taskQueue.nonEmpty
+          entry
+        } else
+          None
+      }
+      head.foreach { taskEntry =>
+        if (!taskEntry.cancelled) {
+          val task = taskEntry.timerTask
+          task.run()
+          executed = true
+        }
       }
     }
-
     executed
   }
 

@@ -17,18 +17,23 @@
 package org.apache.kafka.streams.kstream;
 
 
+import org.apache.kafka.streams.processor.ConnectedStoreProvider;
+
 /**
  * A {@code ValueTransformerSupplier} interface which can create one or more {@link ValueTransformer} instances.
  *
  * @param <V>  value type
  * @param <VR> transformed value type
  * @see ValueTransformer
+ * @see ValueTransformerWithKey
+ * @see ValueTransformerWithKeySupplier
  * @see KStream#transformValues(ValueTransformerSupplier, String...)
+ * @see KStream#transformValues(ValueTransformerWithKeySupplier, String...)
  * @see Transformer
  * @see TransformerSupplier
  * @see KStream#transform(TransformerSupplier, String...)
  */
-public interface ValueTransformerSupplier<V, VR> {
+public interface ValueTransformerSupplier<V, VR> extends ConnectedStoreProvider {
 
     /**
      * Return a new {@link ValueTransformer} instance.

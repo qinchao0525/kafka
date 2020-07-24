@@ -16,13 +16,11 @@
  */
 package kafka.utils
 
-import java.nio.charset.StandardCharsets
-
 import com.fasterxml.jackson.core.JsonProcessingException
 import com.fasterxml.jackson.databind.ObjectMapper
 import kafka.utils.json.JsonValue
 
-import scala.collection._
+import scala.reflect.ClassTag
 
 /**
  * Provides methods for parsing JSON with Jackson and encoding to JSON with a simple and naive custom implementation.
@@ -39,43 +37,44 @@ object Json {
     catch { case _: JsonProcessingException => None }
 
   /**
+   * Parse a JSON string into either a generic type T, or a JsonProcessingException in the case of
+   * exception.
+   */
+  def parseStringAs[T](input: String)(implicit tag: ClassTag[T]): Either[JsonProcessingException, T] = {
+    try Right(mapper.readValue(input, tag.runtimeClass).asInstanceOf[T])
+    catch { case e: JsonProcessingException => Left(e) }
+  }
+
+  /**
    * Parse a JSON byte array into a JsonValue if possible. `None` is returned if `input` is not valid JSON.
    */
   def parseBytes(input: Array[Byte]): Option[JsonValue] =
     try Option(mapper.readTree(input)).map(JsonValue(_))
     catch { case _: JsonProcessingException => None }
 
+  def tryParseBytes(input: Array[Byte]): Either[JsonProcessingException, JsonValue] =
+    try Right(mapper.readTree(input)).map(JsonValue(_))
+    catch { case e: JsonProcessingException => Left(e) }
+
   /**
-   * Encode an object into a JSON string. This method accepts any type T where
-   *   T => null | Boolean | String | Number | Map[String, T] | Array[T] | Iterable[T]
-   * Any other type will result in an exception.
-   * 
-   * This method does not properly handle non-ascii characters. 
+   * Parse a JSON byte array into either a generic type T, or a JsonProcessingException in the case of exception.
    */
-  def encode(obj: Any): String = {
-    obj match {
-      case null => "null"
-      case b: Boolean => b.toString
-      case s: String => "\"" + s + "\""
-      case n: Number => n.toString
-      case m: Map[_, _] => "{" +
-        m.map {
-          case (k, v) => encode(k) + ":" + encode(v)
-          case elem => throw new IllegalArgumentException(s"Invalid map element '$elem' in $obj")
-        }.mkString(",") + "}"
-      case a: Array[_] => encode(a.toSeq)
-      case i: Iterable[_] => "[" + i.map(encode).mkString(",") + "]"
-      case other: AnyRef => throw new IllegalArgumentException(s"Unknown argument of type ${other.getClass}: $other")
-    }
+  def parseBytesAs[T](input: Array[Byte])(implicit tag: ClassTag[T]): Either[JsonProcessingException, T] = {
+    try Right(mapper.readValue(input, tag.runtimeClass).asInstanceOf[T])
+    catch { case e: JsonProcessingException => Left(e) }
   }
 
   /**
-   * Encode an object into a JSON value in bytes. This method accepts any type T where
-   *   T => null | Boolean | String | Number | Map[String, T] | Array[T] | Iterable[T]
-   * Any other type will result in an exception.
-   *
-   * This method does not properly handle non-ascii characters.
+   * Encode an object into a JSON string. This method accepts any type supported by Jackson's ObjectMapper in
+   * the default configuration. That is, Java collections are supported, but Scala collections are not (to avoid
+   * a jackson-scala dependency).
    */
-  def encodeAsBytes(obj: Any): Array[Byte] = encode(obj).getBytes(StandardCharsets.UTF_8)
+  def encodeAsString(obj: Any): String = mapper.writeValueAsString(obj)
 
+  /**
+   * Encode an object into a JSON value in bytes. This method accepts any type supported by Jackson's ObjectMapper in
+   * the default configuration. That is, Java collections are supported, but Scala collections are not (to avoid
+   * a jackson-scala dependency).
+   */
+  def encodeAsBytes(obj: Any): Array[Byte] = mapper.writeValueAsBytes(obj)
 }

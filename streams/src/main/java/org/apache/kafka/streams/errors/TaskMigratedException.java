@@ -17,36 +17,20 @@
 package org.apache.kafka.streams.errors;
 
 
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.streams.processor.internals.Task;
-
 /**
- * Indicates that a task got migrated to another thread.
- * Thus, the task raising this exception can be cleaned up and closed as "zombie".
+ * Indicates that all tasks belongs to the thread have migrated to another thread. This exception can be thrown when
+ * the thread gets fenced (either by the consumer coordinator or by the transaction coordinator), which means it is
+ * no longer part of the group but a "zombie" already
  */
 public class TaskMigratedException extends StreamsException {
 
     private final static long serialVersionUID = 1L;
 
-    public TaskMigratedException(final Task task) {
-        this(task, null);
+    public TaskMigratedException(final String message) {
+        super(message + "; it means all tasks belonging to this thread should be migrated.");
     }
 
-    public TaskMigratedException(final Task task,
-                                 final TopicPartition topicPartition,
-                                 final long endOffset,
-                                 final long pos) {
-        super(String.format("Log end offset of %s should not change while restoring: old end offset %d, current offset %d%n%s",
-                            topicPartition,
-                            endOffset,
-                            pos,
-                            task.toString("> ")),
-            null);
+    public TaskMigratedException(final String message, final Throwable throwable) {
+        super(message + "; it means all tasks belonging to this thread should be migrated.", throwable);
     }
-
-    public TaskMigratedException(final Task task,
-                                 final Throwable throwable) {
-        super(task.toString(), throwable);
-    }
-
 }

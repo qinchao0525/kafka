@@ -21,31 +21,42 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent._
 
-import com.yammer.metrics.core.{Gauge, Meter}
+import com.typesafe.scalalogging.Logger
+import com.yammer.metrics.core.Meter
+import kafka.log.LogConfig
 import kafka.metrics.KafkaMetricsGroup
-import kafka.network.RequestChannel.{BaseRequest, SendAction, ShutdownRequest, NoOpAction, CloseConnectionAction}
-import kafka.utils.{Logging, NotNothing}
+import kafka.server.KafkaConfig
+import kafka.utils.{Logging, NotNothing, Pool}
+import org.apache.kafka.common.config.types.Password
+import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.memory.MemoryPool
+import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData
+import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData._
 import org.apache.kafka.common.network.Send
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.security.auth.KafkaPrincipal
 import org.apache.kafka.common.utils.{Sanitizer, Time}
-import org.apache.log4j.Logger
 
+import scala.annotation.nowarn
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
 object RequestChannel extends Logging {
-  private val requestLogger = Logger.getLogger("kafka.request.logger")
+  private val requestLogger = Logger("kafka.request.logger")
 
-  def isRequestLoggingEnabled: Boolean = requestLogger.isDebugEnabled
+  val RequestQueueSizeMetric = "RequestQueueSize"
+  val ResponseQueueSizeMetric = "ResponseQueueSize"
+  val ProcessorMetricTag = "processor"
+
+  def isRequestLoggingEnabled: Boolean = requestLogger.underlying.isDebugEnabled
 
   sealed trait BaseRequest
   case object ShutdownRequest extends BaseRequest
 
   case class Session(principal: KafkaPrincipal, clientAddress: InetAddress) {
-    val sanitizedUser = Sanitizer.sanitize(principal.getName)
+    val sanitizedUser: String = Sanitizer.sanitize(principal.getName)
   }
 
   class Metrics {
@@ -76,8 +87,8 @@ object RequestChannel extends Logging {
     @volatile var apiLocalCompleteTimeNanos = -1L
     @volatile var responseCompleteTimeNanos = -1L
     @volatile var responseDequeueTimeNanos = -1L
-    @volatile var apiRemoteCompleteTimeNanos = -1L
     @volatile var messageConversionsTimeNanos = 0L
+    @volatile var apiThrottleTimeMs = 0L
     @volatile var temporaryMemoryBytes = 0L
     @volatile var recordNetworkThreadTimeCallback: Option[Long => Unit] = None
 
@@ -94,9 +105,9 @@ object RequestChannel extends Logging {
       releaseBuffer()
     }
 
-    def requestDesc(details: Boolean): String = s"$header -- ${body[AbstractRequest].toString(details)}"
+    def requestDesc(details: Boolean): String = s"$header -- ${loggableRequest.toString(details)}"
 
-    def body[T <: AbstractRequest](implicit classTag: ClassTag[T], nn: NotNothing[T]): T = {
+    def body[T <: AbstractRequest](implicit classTag: ClassTag[T], @nowarn("cat=unused") nn: NotNothing[T]): T = {
       bodyAndSize.request match {
         case r: T => r
         case r =>
@@ -104,25 +115,61 @@ object RequestChannel extends Logging {
       }
     }
 
+    def loggableRequest: AbstractRequest = {
+
+      def loggableValue(resourceType: ConfigResource.Type, name: String, value: String): String = {
+        val maybeSensitive = resourceType match {
+          case ConfigResource.Type.BROKER => KafkaConfig.maybeSensitive(KafkaConfig.configType(name))
+          case ConfigResource.Type.TOPIC => KafkaConfig.maybeSensitive(LogConfig.configType(name))
+          case ConfigResource.Type.BROKER_LOGGER => false
+          case _ => true
+        }
+        if (maybeSensitive) Password.HIDDEN else value
+      }
+
+      bodyAndSize.request match {
+        case alterConfigs: AlterConfigsRequest =>
+          val loggableConfigs = alterConfigs.configs().asScala.map { case (resource, config) =>
+            val loggableEntries = new AlterConfigsRequest.Config(config.entries.asScala.map { entry =>
+                new AlterConfigsRequest.ConfigEntry(entry.name, loggableValue(resource.`type`, entry.name, entry.value))
+            }.asJavaCollection)
+            (resource, loggableEntries)
+          }.asJava
+          new AlterConfigsRequest.Builder(loggableConfigs, alterConfigs.validateOnly).build(alterConfigs.version())
+
+        case alterConfigs: IncrementalAlterConfigsRequest =>
+          val resources = new AlterConfigsResourceCollection(alterConfigs.data.resources.size)
+          alterConfigs.data.resources.forEach { resource =>
+            val newResource = new AlterConfigsResource()
+              .setResourceName(resource.resourceName)
+              .setResourceType(resource.resourceType)
+            resource.configs.forEach { config =>
+              newResource.configs.add(new AlterableConfig()
+                .setName(config.name)
+                .setValue(loggableValue(ConfigResource.Type.forId(resource.resourceType), config.name, config.value))
+                .setConfigOperation(config.configOperation))
+            }
+            resources.add(newResource)
+          }
+          val data = new IncrementalAlterConfigsRequestData()
+            .setValidateOnly(alterConfigs.data().validateOnly())
+            .setResources(resources)
+          new IncrementalAlterConfigsRequest.Builder(data).build(alterConfigs.version)
+
+        case _ =>
+          bodyAndSize.request
+      }
+    }
+
     trace(s"Processor $processor received request: ${requestDesc(true)}")
 
-    def requestThreadTimeNanos = {
+    def requestThreadTimeNanos: Long = {
       if (apiLocalCompleteTimeNanos == -1L) apiLocalCompleteTimeNanos = Time.SYSTEM.nanoseconds
       math.max(apiLocalCompleteTimeNanos - requestDequeueTimeNanos, 0L)
     }
 
-    def updateRequestMetrics(networkThreadTimeNanos: Long, response: Response) {
+    def updateRequestMetrics(networkThreadTimeNanos: Long, response: Response): Unit = {
       val endTimeNanos = Time.SYSTEM.nanoseconds
-      // In some corner cases, apiLocalCompleteTimeNanos may not be set when the request completes if the remote
-      // processing time is really small. This value is set in KafkaApis from a request handling thread.
-      // This may be read in a network thread before the actual update happens in KafkaApis which will cause us to
-      // see a negative value here. In that case, use responseCompleteTimeNanos as apiLocalCompleteTimeNanos.
-      if (apiLocalCompleteTimeNanos < 0)
-        apiLocalCompleteTimeNanos = responseCompleteTimeNanos
-      // If the apiRemoteCompleteTimeNanos is not set (i.e., for requests that do not go through a purgatory), then it is
-      // the same as responseCompleteTimeNanos.
-      if (apiRemoteCompleteTimeNanos < 0)
-        apiRemoteCompleteTimeNanos = responseCompleteTimeNanos
 
       /**
        * Converts nanos to millis with micros precision as additional decimal places in the request log have low
@@ -136,8 +183,7 @@ object RequestChannel extends Logging {
 
       val requestQueueTimeMs = nanosToMs(requestDequeueTimeNanos - startTimeNanos)
       val apiLocalTimeMs = nanosToMs(apiLocalCompleteTimeNanos - requestDequeueTimeNanos)
-      val apiRemoteTimeMs = nanosToMs(apiRemoteCompleteTimeNanos - apiLocalCompleteTimeNanos)
-      val apiThrottleTimeMs = nanosToMs(responseCompleteTimeNanos - apiRemoteCompleteTimeNanos)
+      val apiRemoteTimeMs = nanosToMs(responseCompleteTimeNanos - apiLocalCompleteTimeNanos)
       val responseQueueTimeMs = nanosToMs(responseDequeueTimeNanos - responseCompleteTimeNanos)
       val responseSendTimeMs = nanosToMs(endTimeNanos - responseDequeueTimeNanos)
       val messageConversionsTimeMs = nanosToMs(messageConversionsTimeNanos)
@@ -154,11 +200,11 @@ object RequestChannel extends Logging {
       val metricNames = fetchMetricNames :+ header.apiKey.name
       metricNames.foreach { metricName =>
         val m = metrics(metricName)
-        m.requestRate.mark()
+        m.requestRate(header.apiVersion).mark()
         m.requestQueueTimeHist.update(Math.round(requestQueueTimeMs))
         m.localTimeHist.update(Math.round(apiLocalTimeMs))
         m.remoteTimeHist.update(Math.round(apiRemoteTimeMs))
-        m.throttleTimeHist.update(Math.round(apiThrottleTimeMs))
+        m.throttleTimeHist.update(apiThrottleTimeMs)
         m.responseQueueTimeHist.update(Math.round(responseQueueTimeMs))
         m.responseSendTimeHist.update(Math.round(responseSendTimeMs))
         m.totalTimeHist.update(Math.round(totalTimeMs))
@@ -176,10 +222,9 @@ object RequestChannel extends Logging {
       recordNetworkThreadTimeCallback.foreach(record => record(networkThreadTimeNanos))
 
       if (isRequestLoggingEnabled) {
-        val detailsEnabled = requestLogger.isTraceEnabled
-        val responseString = response.responseAsString.getOrElse(
+        val detailsEnabled = requestLogger.underlying.isTraceEnabled
+        val responseString = response.responseString.getOrElse(
           throw new IllegalStateException("responseAsString should always be defined if request logging is enabled"))
-
         val builder = new StringBuilder(256)
         builder.append("Completed request:").append(requestDesc(detailsEnabled))
           .append(",response:").append(responseString)
@@ -194,6 +239,7 @@ object RequestChannel extends Logging {
           .append(",securityProtocol:").append(context.securityProtocol)
           .append(",principal:").append(session.principal)
           .append(",listener:").append(context.listenerName.value)
+          .append(",clientInformation:").append(context.clientInformation)
         if (temporaryMemoryBytes > 0)
           builder.append(",temporaryMemoryBytes:").append(temporaryMemoryBytes)
         if (messageConversionsTimeMs > 0)
@@ -218,75 +264,123 @@ object RequestChannel extends Logging {
 
   }
 
-  /** responseAsString should only be defined if request logging is enabled */
-  class Response(val request: Request, val responseSend: Option[Send], val responseAction: ResponseAction,
-                 val responseAsString: Option[String]) {
-    request.responseCompleteTimeNanos = Time.SYSTEM.nanoseconds
-    if (request.apiLocalCompleteTimeNanos == -1L) request.apiLocalCompleteTimeNanos = Time.SYSTEM.nanoseconds
+  abstract class Response(val request: Request) {
 
     def processor: Int = request.processor
 
-    override def toString =
-      s"Response(request=$request, responseSend=$responseSend, responseAction=$responseAction), responseAsString=$responseAsString"
+    def responseString: Option[String] = Some("")
+
+    def onComplete: Option[Send => Unit] = None
+
+    override def toString: String
   }
 
-  sealed trait ResponseAction
-  case object SendAction extends ResponseAction
-  case object NoOpAction extends ResponseAction
-  case object CloseConnectionAction extends ResponseAction
+  /** responseAsString should only be defined if request logging is enabled */
+  class SendResponse(request: Request,
+                     val responseSend: Send,
+                     val responseAsString: Option[String],
+                     val onCompleteCallback: Option[Send => Unit]) extends Response(request) {
+    override def responseString: Option[String] = responseAsString
+
+    override def onComplete: Option[Send => Unit] = onCompleteCallback
+
+    override def toString: String =
+      s"Response(type=Send, request=$request, send=$responseSend, asString=$responseAsString)"
+  }
+
+  class NoOpResponse(request: Request) extends Response(request) {
+    override def toString: String =
+      s"Response(type=NoOp, request=$request)"
+  }
+
+  class CloseConnectionResponse(request: Request) extends Response(request) {
+    override def toString: String =
+      s"Response(type=CloseConnection, request=$request)"
+  }
+
+  class StartThrottlingResponse(request: Request) extends Response(request) {
+    override def toString: String =
+      s"Response(type=StartThrottling, request=$request)"
+  }
+
+  class EndThrottlingResponse(request: Request) extends Response(request) {
+    override def toString: String =
+      s"Response(type=EndThrottling, request=$request)"
+  }
 }
 
-class RequestChannel(val numProcessors: Int, val queueSize: Int) extends KafkaMetricsGroup {
+class RequestChannel(val queueSize: Int, val metricNamePrefix : String, time: Time) extends KafkaMetricsGroup {
+  import RequestChannel._
   val metrics = new RequestChannel.Metrics
-  private var responseListeners: List[(Int) => Unit] = Nil
   private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
-  private val responseQueues = new Array[BlockingQueue[RequestChannel.Response]](numProcessors)
-  for(i <- 0 until numProcessors)
-    responseQueues(i) = new LinkedBlockingQueue[RequestChannel.Response]()
+  private val processors = new ConcurrentHashMap[Int, Processor]()
+  val requestQueueSizeMetricName = metricNamePrefix.concat(RequestQueueSizeMetric)
+  val responseQueueSizeMetricName = metricNamePrefix.concat(ResponseQueueSizeMetric)
 
-  newGauge(
-    "RequestQueueSize",
-    new Gauge[Int] {
-      def value = requestQueue.size
+  newGauge(requestQueueSizeMetricName, () => requestQueue.size)
+
+  newGauge(responseQueueSizeMetricName, () => {
+    processors.values.asScala.foldLeft(0) {(total, processor) =>
+      total + processor.responseQueueSize
     }
-  )
-
-  newGauge("ResponseQueueSize", new Gauge[Int]{
-    def value = responseQueues.foldLeft(0) {(total, q) => total + q.size()}
   })
 
-  for (i <- 0 until numProcessors) {
-    newGauge("ResponseQueueSize",
-      new Gauge[Int] {
-        def value = responseQueues(i).size()
-      },
-      Map("processor" -> i.toString)
-    )
+  def addProcessor(processor: Processor): Unit = {
+    if (processors.putIfAbsent(processor.id, processor) != null)
+      warn(s"Unexpected processor with processorId ${processor.id}")
+
+    newGauge(responseQueueSizeMetricName, () => processor.responseQueueSize,
+      Map(ProcessorMetricTag -> processor.id.toString))
+  }
+
+  def removeProcessor(processorId: Int): Unit = {
+    processors.remove(processorId)
+    removeMetric(responseQueueSizeMetricName, Map(ProcessorMetricTag -> processorId.toString))
   }
 
   /** Send a request to be handled, potentially blocking until there is room in the queue for the request */
-  def sendRequest(request: RequestChannel.Request) {
+  def sendRequest(request: RequestChannel.Request): Unit = {
     requestQueue.put(request)
   }
 
   /** Send a response back to the socket server to be sent over the network */
-  def sendResponse(response: RequestChannel.Response) {
+  def sendResponse(response: RequestChannel.Response): Unit = {
+
     if (isTraceEnabled) {
       val requestHeader = response.request.header
-      val message = response.responseAction match {
-        case SendAction =>
-          s"Sending ${requestHeader.apiKey} response to client ${requestHeader.clientId} of ${response.responseSend.get.size} bytes."
-        case NoOpAction =>
+      val message = response match {
+        case sendResponse: SendResponse =>
+          s"Sending ${requestHeader.apiKey} response to client ${requestHeader.clientId} of ${sendResponse.responseSend.size} bytes."
+        case _: NoOpResponse =>
           s"Not sending ${requestHeader.apiKey} response to client ${requestHeader.clientId} as it's not required."
-        case CloseConnectionAction =>
+        case _: CloseConnectionResponse =>
           s"Closing connection for client ${requestHeader.clientId} due to error during ${requestHeader.apiKey}."
+        case _: StartThrottlingResponse =>
+          s"Notifying channel throttling has started for client ${requestHeader.clientId} for ${requestHeader.apiKey}"
+        case _: EndThrottlingResponse =>
+          s"Notifying channel throttling has ended for client ${requestHeader.clientId} for ${requestHeader.apiKey}"
       }
       trace(message)
     }
 
-    responseQueues(response.processor).put(response)
-    for(onResponse <- responseListeners)
-      onResponse(response.processor)
+    response match {
+      // We should only send one of the following per request
+      case _: SendResponse | _: NoOpResponse | _: CloseConnectionResponse =>
+        val request = response.request
+        val timeNanos = time.nanoseconds()
+        request.responseCompleteTimeNanos = timeNanos
+        if (request.apiLocalCompleteTimeNanos == -1L)
+          request.apiLocalCompleteTimeNanos = timeNanos
+      // For a given request, these may happen in addition to one in the previous section, skip updating the metrics
+      case _: StartThrottlingResponse | _: EndThrottlingResponse => ()
+    }
+
+    val processor = processors.get(response.processor)
+    // The processor may be null if it was shutdown. In this case, the connections
+    // are closed, so the response is dropped.
+    if (processor != null) {
+      processor.enqueueResponse(response)
+    }
   }
 
   /** Get the next request or block until specified time has elapsed */
@@ -297,29 +391,23 @@ class RequestChannel(val numProcessors: Int, val queueSize: Int) extends KafkaMe
   def receiveRequest(): RequestChannel.BaseRequest =
     requestQueue.take()
 
-  /** Get a response for the given processor if there is one */
-  def receiveResponse(processor: Int): RequestChannel.Response = {
-    val response = responseQueues(processor).poll()
-    if (response != null)
-      response.request.responseDequeueTimeNanos = Time.SYSTEM.nanoseconds
-    response
-  }
-
-  def addResponseListener(onResponse: Int => Unit) {
-    responseListeners ::= onResponse
-  }
-
-  def updateErrorMetrics(apiKey: ApiKeys, errors: collection.Map[Errors, Integer]) {
+  def updateErrorMetrics(apiKey: ApiKeys, errors: collection.Map[Errors, Integer]): Unit = {
     errors.foreach { case (error, count) =>
       metrics(apiKey.name).markErrorMeter(error, count)
     }
   }
 
-  def shutdown() {
+  def clear(): Unit = {
     requestQueue.clear()
   }
 
+  def shutdown(): Unit = {
+    clear()
+    metrics.close()
+  }
+
   def sendShutdownRequest(): Unit = requestQueue.put(ShutdownRequest)
+
 }
 
 object RequestMetrics {
@@ -341,17 +429,19 @@ object RequestMetrics {
 }
 
 class RequestMetrics(name: String) extends KafkaMetricsGroup {
+
   import RequestMetrics._
 
   val tags = Map("request" -> name)
-  val requestRate = newMeter(RequestsPerSec, "requests", TimeUnit.SECONDS, tags)
+  val requestRateInternal = new Pool[Short, Meter]()
   // time a request spent in a request queue
   val requestQueueTimeHist = newHistogram(RequestQueueTimeMs, biased = true, tags)
   // time a request takes to be processed at the local broker
   val localTimeHist = newHistogram(LocalTimeMs, biased = true, tags)
   // time a request takes to wait on remote brokers (currently only relevant to fetch and produce requests)
   val remoteTimeHist = newHistogram(RemoteTimeMs, biased = true, tags)
-  // time a request is throttled
+  // time a request is throttled, not part of the request processing time (throttling is done at the client level
+  // for clients that support KIP-219 and by muting the channel for the rest)
   val throttleTimeHist = newHistogram(ThrottleTimeMs, biased = true, tags)
   // time a response spent in a response queue
   val responseQueueTimeHist = newHistogram(ResponseQueueTimeMs, biased = true, tags)
@@ -376,6 +466,10 @@ class RequestMetrics(name: String) extends KafkaMetricsGroup {
 
   private val errorMeters = mutable.Map[Errors, ErrorMeter]()
   Errors.values.foreach(error => errorMeters.put(error, new ErrorMeter(name, error)))
+
+  def requestRate(version: Short): Meter = {
+    requestRateInternal.getAndMaybePut(version, newMeter("RequestsPerSec", "requests", TimeUnit.SECONDS, tags + ("version" -> version.toString)))
+  }
 
   class ErrorMeter(name: String, error: Errors) {
     private val tags = Map("request" -> name, "error" -> error.name)
@@ -404,12 +498,12 @@ class RequestMetrics(name: String) extends KafkaMetricsGroup {
     }
   }
 
-  def markErrorMeter(error: Errors, count: Int) {
+  def markErrorMeter(error: Errors, count: Int): Unit = {
     errorMeters(error).getOrCreateMeter().mark(count.toLong)
   }
 
   def removeMetrics(): Unit = {
-    removeMetric(RequestsPerSec, tags)
+    for (version <- requestRateInternal.keys) removeMetric(RequestsPerSec, tags + ("version" -> version.toString))
     removeMetric(RequestQueueTimeMs, tags)
     removeMetric(LocalTimeMs, tags)
     removeMetric(RemoteTimeMs, tags)

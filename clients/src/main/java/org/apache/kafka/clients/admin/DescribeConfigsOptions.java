@@ -22,11 +22,54 @@ import org.apache.kafka.common.annotation.InterfaceStability;
 import java.util.Collection;
 
 /**
- * Options for {@link AdminClient#describeConfigs(Collection)}.
+ * Options for {@link Admin#describeConfigs(Collection)}.
  *
- * The API of this class is evolving, see {@link AdminClient} for details.
+ * The API of this class is evolving, see {@link Admin} for details.
  */
 @InterfaceStability.Evolving
 public class DescribeConfigsOptions extends AbstractOptions<DescribeConfigsOptions> {
 
+    private boolean includeSynonyms = false;
+    private boolean includeDocumentation = false;
+
+    /**
+     * Set the timeout in milliseconds for this operation or {@code null} if the default api timeout for the
+     * AdminClient should be used.
+     *
+     */
+    // This method is retained to keep binary compatibility with 0.11
+    public DescribeConfigsOptions timeoutMs(Integer timeoutMs) {
+        this.timeoutMs = timeoutMs;
+        return this;
+    }
+
+    /**
+     * Return true if synonym configs should be returned in the response.
+     */
+    public boolean includeSynonyms() {
+        return includeSynonyms;
+    }
+
+    /**
+     * Return true if config documentation should be returned in the response.
+     */
+    public boolean includeDocumentation() {
+        return includeDocumentation;
+    }
+
+    /**
+     * Set to true if synonym configs should be returned in the response.
+     */
+    public DescribeConfigsOptions includeSynonyms(boolean includeSynonyms) {
+        this.includeSynonyms = includeSynonyms;
+        return this;
+    }
+
+    /**
+     * Set to true if config documentation should be returned in the response.
+     */
+    public DescribeConfigsOptions includeDocumentation(boolean includeDocumentation) {
+        this.includeDocumentation = includeDocumentation;
+        return this;
+    }
 }

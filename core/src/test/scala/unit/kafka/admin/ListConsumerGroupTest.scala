@@ -16,77 +16,121 @@
  */
 package kafka.admin
 
-import java.util.Properties
-
-import org.easymock.EasyMock
-import org.junit.Before
+import joptsimple.OptionException
+import org.junit.Assert._
 import org.junit.Test
-
-import kafka.admin.ConsumerGroupCommand.ConsumerGroupCommandOptions
-import kafka.admin.ConsumerGroupCommand.ZkConsumerGroupService
-import kafka.consumer.OldConsumer
-import kafka.consumer.Whitelist
-import kafka.integration.KafkaServerTestHarness
-import kafka.server.KafkaConfig
 import kafka.utils.TestUtils
+import org.apache.kafka.common.ConsumerGroupState
+import org.apache.kafka.clients.admin.ConsumerGroupListing
+import java.util.Optional
+import org.scalatest.Assertions.assertThrows
 
+class ListConsumerGroupTest extends ConsumerGroupCommandTest {
 
-class ListConsumerGroupTest extends KafkaServerTestHarness {
+  @Test
+  def testListConsumerGroups(): Unit = {
+    val simpleGroup = "simple-group"
+    addSimpleGroupExecutor(group = simpleGroup)
+    addConsumerGroupExecutor(numConsumers = 1)
 
-  val overridingProps = new Properties()
-  val topic = "foo"
-  val topicFilter = Whitelist(topic)
-  val group = "test.group"
-  val props = new Properties
+    val cgcArgs = Array("--bootstrap-server", brokerList, "--list")
+    val service = getConsumerGroupService(cgcArgs)
 
-  // configure the servers and clients
-  override def generateConfigs =
-    TestUtils.createBrokerConfigs(1, zkConnect, enableControlledShutdown = false).map(KafkaConfig.fromProps(_, overridingProps))
+    val expectedGroups = Set(group, simpleGroup)
+    var foundGroups = Set.empty[String]
+    TestUtils.waitUntilTrue(() => {
+      foundGroups = service.listConsumerGroups().toSet
+      expectedGroups == foundGroups
+    }, s"Expected --list to show groups $expectedGroups, but found $foundGroups.")
+  }
 
-  @Before
-  override def setUp() {
-    super.setUp()
-
-    AdminUtils.createTopic(zkUtils, topic, 1, 1)
-    props.setProperty("group.id", group)
-    props.setProperty("zookeeper.connect", zkConnect)
+  @Test(expected = classOf[OptionException])
+  def testListWithUnrecognizedNewConsumerOption(): Unit = {
+    val cgcArgs = Array("--new-consumer", "--bootstrap-server", brokerList, "--list")
+    getConsumerGroupService(cgcArgs)
   }
 
   @Test
-  def testListGroupWithNoExistingGroup() {
-    val opts = new ConsumerGroupCommandOptions(Array("--zookeeper", zkConnect))
-    val consumerGroupCommand = new ZkConsumerGroupService(opts)
-    try {
-      assert(consumerGroupCommand.listGroups().isEmpty)
-    } finally {
-      consumerGroupCommand.close()
+  def testListConsumerGroupsWithStates(): Unit = {
+    val simpleGroup = "simple-group"
+    addSimpleGroupExecutor(group = simpleGroup)
+    addConsumerGroupExecutor(numConsumers = 1)
+
+    val cgcArgs = Array("--bootstrap-server", brokerList, "--list", "--state")
+    val service = getConsumerGroupService(cgcArgs)
+
+    val expectedListing = Set(
+      new ConsumerGroupListing(simpleGroup, true, Optional.of(ConsumerGroupState.EMPTY)),
+      new ConsumerGroupListing(group, false, Optional.of(ConsumerGroupState.STABLE)))
+
+    var foundListing = Set.empty[ConsumerGroupListing]
+    TestUtils.waitUntilTrue(() => {
+      foundListing = service.listConsumerGroupsWithState(ConsumerGroupState.values.toSet).toSet
+      expectedListing == foundListing
+    }, s"Expected to show groups $expectedListing, but found $foundListing")
+
+    val expectedListingStable = Set(
+      new ConsumerGroupListing(group, false, Optional.of(ConsumerGroupState.STABLE)))
+
+    foundListing = Set.empty[ConsumerGroupListing]
+    TestUtils.waitUntilTrue(() => {
+      foundListing = service.listConsumerGroupsWithState(Set(ConsumerGroupState.STABLE)).toSet
+      expectedListingStable == foundListing
+    }, s"Expected to show groups $expectedListingStable, but found $foundListing")
+  }
+
+  @Test
+  def testConsumerGroupStatesFromString(): Unit = {
+    var result = ConsumerGroupCommand.consumerGroupStatesFromString("Stable")
+    assertEquals(Set(ConsumerGroupState.STABLE), result)
+
+    result = ConsumerGroupCommand.consumerGroupStatesFromString("Stable, PreparingRebalance")
+    assertEquals(Set(ConsumerGroupState.STABLE, ConsumerGroupState.PREPARING_REBALANCE), result)
+
+    result = ConsumerGroupCommand.consumerGroupStatesFromString("Dead,CompletingRebalance,")
+    assertEquals(Set(ConsumerGroupState.DEAD, ConsumerGroupState.COMPLETING_REBALANCE), result)
+
+    assertThrows[IllegalArgumentException] {
+      ConsumerGroupCommand.consumerGroupStatesFromString("bad, wrong")
+    }
+
+    assertThrows[IllegalArgumentException] {
+      ConsumerGroupCommand.consumerGroupStatesFromString("stable")
+    }
+
+    assertThrows[IllegalArgumentException] {
+      ConsumerGroupCommand.consumerGroupStatesFromString("  bad, Stable")
+    }
+
+    assertThrows[IllegalArgumentException] {
+      ConsumerGroupCommand.consumerGroupStatesFromString("   ,   ,")
     }
   }
 
   @Test
-  def testListGroupWithSomeGroups() {
-    // mocks
-    val consumer1Mock = EasyMock.createMockBuilder(classOf[OldConsumer]).withConstructor(topicFilter, props).createMock()
-    props.setProperty("group.id", "some.other.group")
-    val consumer2Mock = EasyMock.createMockBuilder(classOf[OldConsumer]).withConstructor(topicFilter, props).createMock()
+  def testListGroupCommand(): Unit = {
+    val simpleGroup = "simple-group"
+    addSimpleGroupExecutor(group = simpleGroup)
+    addConsumerGroupExecutor(numConsumers = 1)
+    var out = ""
 
-    // stubs
-    val opts = new ConsumerGroupCommandOptions(Array("--zookeeper", zkConnect))
-    val consumerGroupCommand = new ZkConsumerGroupService(opts)
-
-    // simulation
-    EasyMock.replay(consumer1Mock)
-    EasyMock.replay(consumer2Mock)
-
-    // action/test
+    var cgcArgs = Array("--bootstrap-server", brokerList, "--list")
     TestUtils.waitUntilTrue(() => {
-        val groups = consumerGroupCommand.listGroups()
-        groups.size == 2 && groups.contains(group)
-      }, "Expected a different list group results.")
+      out = TestUtils.grabConsoleOutput(ConsumerGroupCommand.main(cgcArgs))
+      !out.contains("STATE") && out.contains(simpleGroup) && out.contains(group)
+    }, s"Expected to find $simpleGroup, $group and no header, but found $out")
 
-    // cleanup
-    consumerGroupCommand.close()
-    consumer1Mock.stop()
-    consumer2Mock.stop()
+    cgcArgs = Array("--bootstrap-server", brokerList, "--list", "--state")
+    TestUtils.waitUntilTrue(() => {
+      out = TestUtils.grabConsoleOutput(ConsumerGroupCommand.main(cgcArgs))
+      out.contains("STATE") && out.contains(simpleGroup) && out.contains(group)
+    }, s"Expected to find $simpleGroup, $group and the header, but found $out")
+
+    cgcArgs = Array("--bootstrap-server", brokerList, "--list", "--state", "Stable")
+    TestUtils.waitUntilTrue(() => {
+      out = TestUtils.grabConsoleOutput(ConsumerGroupCommand.main(cgcArgs))
+      out.contains("STATE") && out.contains(group) && out.contains("Stable")
+    }, s"Expected to find $group in state Stable and the header, but found $out")
   }
+
 }

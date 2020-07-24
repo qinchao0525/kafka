@@ -21,16 +21,19 @@ import java.io.File
 import java.util.Properties
 import javax.security.auth.login.Configuration
 
-import kafka.admin.ConfigCommand
+import scala.collection.Seq
 import kafka.security.minikdc.MiniKdc
-import kafka.server.KafkaConfig
+import kafka.server.{ConfigType, KafkaConfig}
 import kafka.utils.JaasTestUtils.{JaasSection, Krb5LoginModule, ZkDigestModule}
 import kafka.utils.{JaasTestUtils, TestUtils}
+import kafka.zk.{AdminZkClient, KafkaZkClient}
 import org.apache.kafka.common.config.SaslConfigs
 import org.apache.kafka.common.config.internals.BrokerSecurityConfigs
 import org.apache.kafka.common.security.JaasUtils
 import org.apache.kafka.common.security.authenticator.LoginManager
-import org.apache.kafka.common.security.scram.ScramMechanism
+import org.apache.kafka.common.security.scram.internals.{ScramCredentialUtils, ScramFormatter, ScramMechanism}
+import org.apache.kafka.common.utils.Time
+import org.apache.zookeeper.client.ZKClientConfig
 
 /*
  * Implements an enumeration for the modes enabled here:
@@ -51,7 +54,7 @@ trait SaslSetup {
   private var serverKeytabFile: Option[File] = None
   private var clientKeytabFile: Option[File] = None
 
-  def startSasl(jaasSections: Seq[JaasSection]) {
+  def startSasl(jaasSections: Seq[JaasSection]): Unit = {
     // Important if tests leak consumers, producers or brokers
     LoginManager.closeAll()
     val hasKerberos = jaasSections.exists(_.modules.exists {
@@ -59,12 +62,7 @@ trait SaslSetup {
       case _ => false
     })
     if (hasKerberos) {
-      val (serverKeytabFile, clientKeytabFile) = maybeCreateEmptyKeytabFiles()
-      kdc = new MiniKdc(kdcConf, workDir)
-      kdc.start()
-      kdc.createPrincipal(serverKeytabFile, JaasTestUtils.KafkaServerPrincipalUnqualifiedName + "/localhost")
-      kdc.createPrincipal(clientKeytabFile,
-        JaasTestUtils.KafkaClientPrincipalUnqualifiedName, JaasTestUtils.KafkaClientPrincipalUnqualifiedName2)
+      initializeKerberos()
     }
     writeJaasConfigurationToFile(jaasSections)
     val hasZk = jaasSections.exists(_.modules.exists {
@@ -73,6 +71,15 @@ trait SaslSetup {
     })
     if (hasZk)
       System.setProperty("zookeeper.authProvider.1", "org.apache.zookeeper.server.auth.SASLAuthenticationProvider")
+  }
+
+  protected def initializeKerberos(): Unit = {
+    val (serverKeytabFile, clientKeytabFile) = maybeCreateEmptyKeytabFiles()
+    kdc = new MiniKdc(kdcConf, workDir)
+    kdc.start()
+    kdc.createPrincipal(serverKeytabFile, JaasTestUtils.KafkaServerPrincipalUnqualifiedName + "/localhost")
+    kdc.createPrincipal(clientKeytabFile,
+      JaasTestUtils.KafkaClientPrincipalUnqualifiedName, JaasTestUtils.KafkaClientPrincipalUnqualifiedName2)
   }
 
   /** Return a tuple with the path to the server keytab file and client keytab file */
@@ -89,7 +96,7 @@ trait SaslSetup {
                              mode: SaslSetupMode = Both,
                              kafkaServerEntryName: String = JaasTestUtils.KafkaServerContextName): Seq[JaasSection] = {
     val hasKerberos = mode != ZkSasl &&
-      (kafkaServerSaslMechanisms.contains("GSSAPI") || kafkaClientSaslMechanism.exists(_ == "GSSAPI"))
+      (kafkaServerSaslMechanisms.contains("GSSAPI") || kafkaClientSaslMechanism.contains("GSSAPI"))
     if (hasKerberos)
       maybeCreateEmptyKeytabFiles()
     mode match {
@@ -102,14 +109,14 @@ trait SaslSetup {
     }
   }
 
-  private def writeJaasConfigurationToFile(jaasSections: Seq[JaasSection]) {
+  private def writeJaasConfigurationToFile(jaasSections: Seq[JaasSection]): Unit = {
     val file = JaasTestUtils.writeJaasContextsToFile(jaasSections)
     System.setProperty(JaasUtils.JAVA_LOGIN_CONFIG_PARAM, file.getAbsolutePath)
     // This will cause a reload of the Configuration singleton when `getConfiguration` is called
     Configuration.setConfiguration(null)
   }
 
-  def closeSasl() {
+  def closeSasl(): Unit = {
     if (kdc != null)
       kdc.stop()
     // Important if tests leak consumers, producers or brokers
@@ -134,16 +141,32 @@ trait SaslSetup {
     props
   }
 
-  def jaasClientLoginModule(clientSaslMechanism: String): String =
-    JaasTestUtils.clientLoginModule(clientSaslMechanism, clientKeytabFile)
+  def jaasClientLoginModule(clientSaslMechanism: String, serviceName: Option[String] = None): String = {
+    if (serviceName.isDefined)
+      JaasTestUtils.clientLoginModule(clientSaslMechanism, clientKeytabFile, serviceName.get)
+    else
+      JaasTestUtils.clientLoginModule(clientSaslMechanism, clientKeytabFile)
+  }
 
   def createScramCredentials(zkConnect: String, userName: String, password: String): Unit = {
-    val credentials = ScramMechanism.values.map(m => s"${m.mechanismName}=[iterations=4096,password=$password]")
-    val args = Array("--zookeeper", zkConnect,
-      "--alter", "--add-config", credentials.mkString(","),
-      "--entity-type", "users",
-      "--entity-name", userName)
-    ConfigCommand.main(args)
+    val zkClientConfig = new ZKClientConfig()
+    val zkClient = KafkaZkClient(
+      zkConnect, JaasUtils.isZkSaslEnabled || KafkaConfig.zkTlsClientAuthEnabled(zkClientConfig), 30000, 30000,
+      Int.MaxValue, Time.SYSTEM, zkClientConfig = Some(zkClientConfig))
+    val adminZkClient = new AdminZkClient(zkClient)
+
+    val entityType = ConfigType.User
+    val entityName = userName
+    val configs = adminZkClient.fetchEntityConfig(entityType, entityName)
+
+    ScramMechanism.values().foreach(mechanism => {
+      val credential = new ScramFormatter(mechanism).generateCredential(password, 4096)
+      val credentialString = ScramCredentialUtils.credentialToString(credential)
+      configs.setProperty(mechanism.mechanismName, credentialString)
+    })
+
+    adminZkClient.changeConfigs(entityType, entityName, configs)
+    zkClient.close()
   }
 
 }

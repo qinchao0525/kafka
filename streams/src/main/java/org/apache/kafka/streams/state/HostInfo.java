@@ -16,10 +16,14 @@
  */
 package org.apache.kafka.streams.state;
 
+import static org.apache.kafka.common.utils.Utils.getHost;
+import static org.apache.kafka.common.utils.Utils.getPort;
+
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.processor.StreamPartitioner;
-import org.apache.kafka.streams.processor.internals.StreamPartitionAssignor;
+import org.apache.kafka.streams.processor.internals.StreamsPartitionAssignor;
 
 /**
  * Represents a user defined endpoint in a {@link org.apache.kafka.streams.KafkaStreams} application.
@@ -30,7 +34,7 @@ import org.apache.kafka.streams.processor.internals.StreamPartitionAssignor;
  *  {@link KafkaStreams#metadataForKey(String, Object, Serializer)}
  *
  *  The HostInfo is constructed during Partition Assignment
- *  see {@link StreamPartitionAssignor}
+ *  see {@link StreamsPartitionAssignor}
  *  It is extracted from the config {@link org.apache.kafka.streams.StreamsConfig#APPLICATION_SERVER_CONFIG}
  *
  *  If developers wish to expose an endpoint in their KafkaStreams applications they should provide the above
@@ -44,6 +48,33 @@ public class HostInfo {
                     final int port) {
         this.host = host;
         this.port = port;
+    }
+
+    /**
+     * @throws ConfigException if the host or port cannot be parsed from the given endpoint string
+     * @return a new HostInfo or null if endPoint is null or has no characters
+     */
+    public static HostInfo buildFromEndpoint(final String endPoint) {
+        if (endPoint == null || endPoint.trim().isEmpty()) {
+            return null;
+        }
+
+        final String host = getHost(endPoint);
+        final Integer port = getPort(endPoint);
+
+        if (host == null || port == null) {
+            throw new ConfigException(
+                String.format("Error parsing host address %s. Expected format host:port.", endPoint)
+            );
+        }
+        return new HostInfo(host, port);
+    }
+
+    /**
+     * @return a sentinel for cases where the host metadata is currently unavailable, eg during rebalance operations.
+     */
+    public static HostInfo unavailable() {
+        return new HostInfo("unavailable", -1);
     }
 
     @Override

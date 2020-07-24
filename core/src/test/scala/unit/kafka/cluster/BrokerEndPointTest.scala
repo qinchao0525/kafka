@@ -17,11 +17,18 @@
 
 package kafka.cluster
 
+import java.nio.charset.StandardCharsets
+
 import kafka.utils.TestUtils
+import kafka.zk.BrokerIdZNode
+import org.apache.kafka.common.feature.{Features, SupportedVersionRange}
+import org.apache.kafka.common.feature.Features._
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.junit.Assert.{assertEquals, assertNotEquals, assertNull}
 import org.junit.Test
+
+import scala.jdk.CollectionConverters._
 
 class BrokerEndPointTest {
 
@@ -44,7 +51,7 @@ class BrokerEndPointTest {
 
   @Test
   def testFromJsonFutureVersion(): Unit = {
-    // `createBroker` should support future compatible versions, we use a hypothetical future version here
+    // Future compatible versions should be supported, we use a hypothetical future version here
     val brokerInfoStr = """{
       "foo":"bar",
       "version":100,
@@ -54,9 +61,9 @@ class BrokerEndPointTest {
       "timestamp":"1416974968782",
       "endpoints":["SSL://localhost:9093"]
     }"""
-    val broker = Broker.createBroker(1, brokerInfoStr)
+    val broker = parseBrokerJson(1, brokerInfoStr)
     assertEquals(1, broker.id)
-    val brokerEndPoint = broker.getBrokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.SSL))
+    val brokerEndPoint = broker.brokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.SSL))
     assertEquals("localhost", brokerEndPoint.host)
     assertEquals(9093, brokerEndPoint.port)
   }
@@ -71,9 +78,9 @@ class BrokerEndPointTest {
       "timestamp":"1416974968782",
       "endpoints":["PLAINTEXT://localhost:9092"]
     }"""
-    val broker = Broker.createBroker(1, brokerInfoStr)
+    val broker = parseBrokerJson(1, brokerInfoStr)
     assertEquals(1, broker.id)
-    val brokerEndPoint = broker.getBrokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    val brokerEndPoint = broker.brokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
     assertEquals("localhost", brokerEndPoint.host)
     assertEquals(9092, brokerEndPoint.port)
   }
@@ -81,9 +88,9 @@ class BrokerEndPointTest {
   @Test
   def testFromJsonV1(): Unit = {
     val brokerInfoStr = """{"jmx_port":-1,"timestamp":"1420485325400","host":"172.16.8.243","version":1,"port":9091}"""
-    val broker = Broker.createBroker(1, brokerInfoStr)
+    val broker = parseBrokerJson(1, brokerInfoStr)
     assertEquals(1, broker.id)
-    val brokerEndPoint = broker.getBrokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
+    val brokerEndPoint = broker.brokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT))
     assertEquals("172.16.8.243", brokerEndPoint.host)
     assertEquals(9091, brokerEndPoint.port)
   }
@@ -99,9 +106,9 @@ class BrokerEndPointTest {
       "endpoints":["PLAINTEXT://host1:9092", "SSL://host1:9093"],
       "rack":"dc1"
     }"""
-    val broker = Broker.createBroker(1, json)
+    val broker = parseBrokerJson(1, json)
     assertEquals(1, broker.id)
-    val brokerEndPoint = broker.getBrokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.SSL))
+    val brokerEndPoint = broker.brokerEndPoint(ListenerName.forSecurityProtocol(SecurityProtocol.SSL))
     assertEquals("host1", brokerEndPoint.host)
     assertEquals(9093, brokerEndPoint.port)
     assertEquals(Some("dc1"), broker.rack)
@@ -119,9 +126,9 @@ class BrokerEndPointTest {
       "listener_security_protocol_map":{"CLIENT":"SSL", "REPLICATION":"PLAINTEXT"},
       "rack":null
     }"""
-    val broker = Broker.createBroker(1, json)
+    val broker = parseBrokerJson(1, json)
     assertEquals(1, broker.id)
-    val brokerEndPoint = broker.getBrokerEndPoint(new ListenerName("CLIENT"))
+    val brokerEndPoint = broker.brokerEndPoint(new ListenerName("CLIENT"))
     assertEquals("host1", brokerEndPoint.host)
     assertEquals(9092, brokerEndPoint.port)
     assertEquals(None, broker.rack)
@@ -138,12 +145,59 @@ class BrokerEndPointTest {
       "endpoints":["CLIENT://host1:9092", "REPLICATION://host1:9093"],
       "listener_security_protocol_map":{"CLIENT":"SSL", "REPLICATION":"PLAINTEXT"}
     }"""
-    val broker = Broker.createBroker(1, json)
+    val broker = parseBrokerJson(1, json)
     assertEquals(1, broker.id)
-    val brokerEndPoint = broker.getBrokerEndPoint(new ListenerName("CLIENT"))
+    val brokerEndPoint = broker.brokerEndPoint(new ListenerName("CLIENT"))
     assertEquals("host1", brokerEndPoint.host)
     assertEquals(9092, brokerEndPoint.port)
     assertEquals(None, broker.rack)
+  }
+
+  @Test
+  def testFromJsonV4WithNoFeatures(): Unit = {
+    val json = """{
+      "version":4,
+      "host":"localhost",
+      "port":9092,
+      "jmx_port":9999,
+      "timestamp":"2233345666",
+      "endpoints":["CLIENT://host1:9092", "REPLICATION://host1:9093"],
+      "listener_security_protocol_map":{"CLIENT":"SSL", "REPLICATION":"PLAINTEXT"},
+      "rack":"dc1"
+    }"""
+    val broker = parseBrokerJson(1, json)
+    assertEquals(1, broker.id)
+    val brokerEndPoint = broker.brokerEndPoint(new ListenerName("CLIENT"))
+    assertEquals("host1", brokerEndPoint.host)
+    assertEquals(9092, brokerEndPoint.port)
+    assertEquals(Some("dc1"), broker.rack)
+    assertEquals(emptySupportedFeatures, broker.features)
+  }
+
+  @Test
+  def testFromJsonV5(): Unit = {
+    val json = """{
+      "version":5,
+      "host":"localhost",
+      "port":9092,
+      "jmx_port":9999,
+      "timestamp":"2233345666",
+      "endpoints":["CLIENT://host1:9092", "REPLICATION://host1:9093"],
+      "listener_security_protocol_map":{"CLIENT":"SSL", "REPLICATION":"PLAINTEXT"},
+      "rack":"dc1",
+      "features": {"feature1": {"min_version": 1, "max_version": 2}, "feature2": {"min_version": 2, "max_version": 4}}
+    }"""
+    val broker = parseBrokerJson(1, json)
+    assertEquals(1, broker.id)
+    val brokerEndPoint = broker.brokerEndPoint(new ListenerName("CLIENT"))
+    assertEquals("host1", brokerEndPoint.host)
+    assertEquals(9092, brokerEndPoint.port)
+    assertEquals(Some("dc1"), broker.rack)
+    assertEquals(Features.supportedFeatures(
+      Map[String, SupportedVersionRange](
+        "feature1" -> new SupportedVersionRange(1, 2),
+        "feature2" -> new SupportedVersionRange(2, 4)).asJava),
+      broker.features)
   }
 
   @Test
@@ -212,4 +266,7 @@ class BrokerEndPointTest {
     assertEquals(9092, endpoint.port)
     assertEquals("PLAINTEXT://MyHostname:9092", endpoint.connectionString)
   }
+
+  private def parseBrokerJson(id: Int, jsonString: String): Broker =
+    BrokerIdZNode.decode(id, jsonString.getBytes(StandardCharsets.UTF_8)).broker
 }

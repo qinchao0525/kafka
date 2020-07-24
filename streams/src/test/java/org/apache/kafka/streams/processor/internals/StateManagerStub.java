@@ -22,8 +22,8 @@ import org.apache.kafka.streams.processor.StateRestoreCallback;
 import org.apache.kafka.streams.processor.StateStore;
 
 import java.io.File;
-import java.io.IOException;
 import java.util.Map;
+import org.apache.kafka.streams.processor.internals.Task.TaskType;
 
 public class StateManagerStub implements StateManager {
 
@@ -33,18 +33,14 @@ public class StateManagerStub implements StateManager {
     }
 
     @Override
-    public void register(final StateStore store, final StateRestoreCallback stateRestoreCallback) {}
+    public void registerStore(final StateStore store,
+                              final StateRestoreCallback stateRestoreCallback) {}
 
     @Override
     public void flush() {}
 
     @Override
-    public void close(final Map<TopicPartition, Long> offsets) throws IOException {}
-
-    @Override
-    public StateStore getGlobalStore(final String name) {
-        return null;
-    }
+    public void close() {}
 
     @Override
     public StateStore getStore(final String name) {
@@ -52,11 +48,25 @@ public class StateManagerStub implements StateManager {
     }
 
     @Override
-    public Map<TopicPartition, Long> checkpointed() {
+    public StateStore getGlobalStore(final String name) {
+        return null;
+    }
+
+    @Override
+    public Map<TopicPartition, Long> changelogOffsets() {
         return null;
     }
 
     @Override
     public void checkpoint(final Map<TopicPartition, Long> offsets) {}
 
+    @Override
+    public TaskType taskType() {
+        return null;
+    }
+
+    @Override
+    public String changelogFor(final String storeName) {
+        return null;
+    }
 }

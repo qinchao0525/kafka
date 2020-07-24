@@ -27,9 +27,9 @@ import org.apache.kafka.common.requests.DescribeLogDirsResponse.LogDirInfo;
 
 
 /**
- * The result of the {@link AdminClient#describeLogDirs(Collection)} call.
+ * The result of the {@link Admin#describeLogDirs(Collection)} call.
  *
- * The API of this class is evolving, see {@link AdminClient} for details.
+ * The API of this class is evolving, see {@link Admin} for details.
  */
 @InterfaceStability.Evolving
 public class DescribeLogDirsResult {
@@ -51,7 +51,7 @@ public class DescribeLogDirsResult {
      */
     public KafkaFuture<Map<Integer, Map<String, LogDirInfo>>> all() {
         return KafkaFuture.allOf(futures.values().toArray(new KafkaFuture[0])).
-            thenApply(new KafkaFuture.Function<Void, Map<Integer, Map<String, LogDirInfo>>>() {
+            thenApply(new KafkaFuture.BaseFunction<Void, Map<Integer, Map<String, LogDirInfo>>>() {
                 @Override
                 public Map<Integer, Map<String, LogDirInfo>> apply(Void v) {
                     Map<Integer, Map<String, LogDirInfo>> descriptions = new HashMap<>(futures.size());

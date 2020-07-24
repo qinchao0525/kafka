@@ -16,15 +16,13 @@
  */
 package org.apache.kafka.streams.state.internals;
 
-import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.kstream.Windowed;
-import org.apache.kafka.streams.kstream.internals.SessionKeySerde;
 import org.apache.kafka.streams.kstream.internals.SessionWindow;
 import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.internals.ProcessorContextImpl;
 import org.apache.kafka.streams.state.SessionStore;
-import org.apache.kafka.test.NoOpRecordCollector;
+import org.apache.kafka.test.MockRecordCollector;
 import org.easymock.EasyMock;
 import org.easymock.EasyMockRunner;
 import org.easymock.Mock;
@@ -33,30 +31,11 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
-import java.util.HashMap;
-import java.util.Map;
-
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-
 @RunWith(EasyMockRunner.class)
 public class ChangeLoggingSessionBytesStoreTest {
 
     private final TaskId taskId = new TaskId(0, 0);
-    private final Map sent = new HashMap<>();
-    private final NoOpRecordCollector collector = new NoOpRecordCollector() {
-        @Override
-        public <K, V> void send(final String topic,
-                                K key,
-                                V value,
-                                Integer partition,
-                                Long timestamp,
-                                Serializer<K> keySerializer,
-                                Serializer<V> valueSerializer) {
-            sent.put(key, value);
-        }
-    };
+    private final MockRecordCollector collector = new MockRecordCollector();
 
     @Mock(type = MockType.NICE)
     private SessionStore<Bytes, byte[]> inner;
@@ -69,9 +48,8 @@ public class ChangeLoggingSessionBytesStoreTest {
     private final Windowed<Bytes> key1 = new Windowed<>(bytesKey, new SessionWindow(0, 0));
 
     @Before
-    public void setUp() throws Exception {
+    public void setUp() {
         store = new ChangeLoggingSessionBytesStore(inner);
-
     }
 
     private void init() {
@@ -85,35 +63,45 @@ public class ChangeLoggingSessionBytesStoreTest {
     }
 
     @Test
-    public void shouldLogPuts() throws Exception {
+    public void shouldLogPuts() {
         inner.put(key1, value1);
         EasyMock.expectLastCall();
 
         init();
 
+        final Bytes binaryKey = SessionKeySchema.toBinary(key1);
+
+        EasyMock.reset(context);
+        context.logChange(store.name(), binaryKey, value1, 0L);
+
+        EasyMock.replay(context);
         store.put(key1, value1);
 
-        assertArrayEquals(value1, (byte[]) sent.get(SessionKeySerde.bytesToBinary(key1)));
-        EasyMock.verify(inner);
+        EasyMock.verify(inner, context);
     }
 
     @Test
-    public void shouldLogRemoves() throws Exception {
+    public void shouldLogRemoves() {
         inner.remove(key1);
         EasyMock.expectLastCall();
 
         init();
         store.remove(key1);
 
-        final Bytes binaryKey = SessionKeySerde.bytesToBinary(key1);
-        assertTrue(sent.containsKey(binaryKey));
-        assertNull(sent.get(binaryKey));
-        EasyMock.verify(inner);
+        final Bytes binaryKey = SessionKeySchema.toBinary(key1);
+
+        EasyMock.reset(context);
+        context.logChange(store.name(), binaryKey, null, 0L);
+
+        EasyMock.replay(context);
+        store.remove(key1);
+
+        EasyMock.verify(inner, context);
     }
 
     @Test
-    public void shouldDelegateToUnderlyingStoreWhenFetching() throws Exception {
-        EasyMock.expect(inner.findSessions(bytesKey, 0, Long.MAX_VALUE)).andReturn(KeyValueIterators.<Windowed<Bytes>, byte[]>emptyIterator());
+    public void shouldDelegateToUnderlyingStoreWhenFetching() {
+        EasyMock.expect(inner.fetch(bytesKey)).andReturn(KeyValueIterators.emptyIterator());
 
         init();
 
@@ -122,8 +110,8 @@ public class ChangeLoggingSessionBytesStoreTest {
     }
 
     @Test
-    public void shouldDelegateToUnderlyingStoreWhenFetchingRange() throws Exception {
-        EasyMock.expect(inner.findSessions(bytesKey, bytesKey, 0, Long.MAX_VALUE)).andReturn(KeyValueIterators.<Windowed<Bytes>, byte[]>emptyIterator());
+    public void shouldDelegateToUnderlyingStoreWhenFetchingRange() {
+        EasyMock.expect(inner.fetch(bytesKey, bytesKey)).andReturn(KeyValueIterators.emptyIterator());
 
         init();
 
@@ -132,8 +120,8 @@ public class ChangeLoggingSessionBytesStoreTest {
     }
 
     @Test
-    public void shouldDelegateToUnderlyingStoreWhenFindingSessions() throws Exception {
-        EasyMock.expect(inner.findSessions(bytesKey, 0, 1)).andReturn(KeyValueIterators.<Windowed<Bytes>, byte[]>emptyIterator());
+    public void shouldDelegateToUnderlyingStoreWhenFindingSessions() {
+        EasyMock.expect(inner.findSessions(bytesKey, 0, 1)).andReturn(KeyValueIterators.emptyIterator());
 
         init();
 
@@ -142,8 +130,8 @@ public class ChangeLoggingSessionBytesStoreTest {
     }
 
     @Test
-    public void shouldDelegateToUnderlyingStoreWhenFindingSessionRange() throws Exception {
-        EasyMock.expect(inner.findSessions(bytesKey, bytesKey, 0, 1)).andReturn(KeyValueIterators.<Windowed<Bytes>, byte[]>emptyIterator());
+    public void shouldDelegateToUnderlyingStoreWhenFindingSessionRange() {
+        EasyMock.expect(inner.findSessions(bytesKey, bytesKey, 0, 1)).andReturn(KeyValueIterators.emptyIterator());
 
         init();
 
@@ -152,7 +140,7 @@ public class ChangeLoggingSessionBytesStoreTest {
     }
 
     @Test
-    public void shouldFlushUnderlyingStore() throws Exception {
+    public void shouldFlushUnderlyingStore() {
         inner.flush();
         EasyMock.expectLastCall();
 
@@ -163,7 +151,7 @@ public class ChangeLoggingSessionBytesStoreTest {
     }
 
     @Test
-    public void shouldCloseUnderlyingStore() throws Exception {
+    public void shouldCloseUnderlyingStore() {
         inner.close();
         EasyMock.expectLastCall();
 

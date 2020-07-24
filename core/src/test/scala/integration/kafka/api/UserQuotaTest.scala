@@ -15,13 +15,10 @@
 package kafka.api
 
 import java.io.File
-import java.util.Properties
 
-import kafka.admin.AdminUtils
-import kafka.server.{ConfigEntityName, KafkaConfig, QuotaId}
+import kafka.server.{KafkaConfig, KafkaServer}
 import kafka.utils.JaasTestUtils
-import org.apache.kafka.common.security.auth.SecurityProtocol
-import org.apache.kafka.common.utils.Sanitizer
+import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.junit.{After, Before}
 
 class UserQuotaTest extends BaseQuotaTest with SaslSetup {
@@ -33,20 +30,19 @@ class UserQuotaTest extends BaseQuotaTest with SaslSetup {
   override protected val serverSaslProperties = Some(kafkaServerSaslProperties(kafkaServerSaslMechanisms, kafkaClientSaslMechanism))
   override protected val clientSaslProperties = Some(kafkaClientSaslProperties(kafkaClientSaslMechanism))
 
-  override val userPrincipal = JaasTestUtils.KafkaClientPrincipalUnqualifiedName2
-  override val producerQuotaId = QuotaId(Some(userPrincipal), None, None)
-  override val consumerQuotaId = QuotaId(Some(userPrincipal), None, None)
-
-
   @Before
-  override def setUp() {
+  override def setUp(): Unit = {
     startSasl(jaasSections(kafkaServerSaslMechanisms, Some("GSSAPI"), KafkaSasl, JaasTestUtils.KafkaServerContextName))
     this.serverConfig.setProperty(KafkaConfig.ProducerQuotaBytesPerSecondDefaultProp, Long.MaxValue.toString)
     this.serverConfig.setProperty(KafkaConfig.ConsumerQuotaBytesPerSecondDefaultProp, Long.MaxValue.toString)
     super.setUp()
-    val defaultProps = quotaProperties(defaultProducerQuota, defaultConsumerQuota, defaultRequestQuota)
-    AdminUtils.changeUserOrUserClientIdConfig(zkUtils, ConfigEntityName.Default, defaultProps)
-    waitForQuotaUpdate(defaultProducerQuota, defaultConsumerQuota, defaultRequestQuota)
+    quotaTestClients.alterClientQuotas(
+      quotaTestClients.clientQuotaAlteration(
+        quotaTestClients.clientQuotaEntity(Some(QuotaTestClients.DefaultEntity), None),
+        Some(defaultProducerQuota), Some(defaultConsumerQuota), Some(defaultRequestQuota)
+      )
+    )
+    quotaTestClients.waitForQuotaUpdate(defaultProducerQuota, defaultConsumerQuota, defaultRequestQuota)
   }
 
   @After
@@ -55,18 +51,35 @@ class UserQuotaTest extends BaseQuotaTest with SaslSetup {
     closeSasl()
   }
 
-  override def overrideQuotas(producerQuota: Long, consumerQuota: Long, requestQuota: Double) {
-    val props = quotaProperties(producerQuota, consumerQuota, requestQuota)
-    updateQuotaOverride(props)
-  }
+  override def createQuotaTestClients(topic: String, leaderNode: KafkaServer): QuotaTestClients = {
+    val producer = createProducer()
+    val consumer = createConsumer()
+    val adminClient = createAdminClient()
 
-  override def removeQuotaOverrides() {
-    val emptyProps = new Properties
-    updateQuotaOverride(emptyProps)
-    updateQuotaOverride(emptyProps)
-  }
+    new QuotaTestClients(topic, leaderNode, producerClientId, consumerClientId, producer, consumer, adminClient) {
+      override val userPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, JaasTestUtils.KafkaClientPrincipalUnqualifiedName2)
 
-  private def updateQuotaOverride(properties: Properties) {
-    AdminUtils.changeUserOrUserClientIdConfig(zkUtils, Sanitizer.sanitize(userPrincipal), properties)
+      override def quotaMetricTags(clientId: String): Map[String, String] = {
+        Map("user" -> userPrincipal.getName, "client-id" -> "")
+      }
+
+      override def overrideQuotas(producerQuota: Long, consumerQuota: Long, requestQuota: Double): Unit = {
+        alterClientQuotas(
+          clientQuotaAlteration(
+            clientQuotaEntity(Some(userPrincipal.getName), None),
+            Some(producerQuota), Some(consumerQuota), Some(requestQuota)
+          )
+        )
+      }
+
+      override def removeQuotaOverrides(): Unit = {
+        alterClientQuotas(
+          clientQuotaAlteration(
+            clientQuotaEntity(Some(userPrincipal.getName), None),
+            None, None, None
+          )
+        )
+      }
+    }
   }
 }

@@ -19,8 +19,9 @@ package org.apache.kafka.connect.runtime;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.MetricsContext;
 import org.apache.kafka.common.metrics.MetricsReporter;
-import org.apache.kafka.connect.util.MockTime;
+import org.apache.kafka.common.utils.MockTime;
 
 import java.util.HashMap;
 import java.util.List;
@@ -40,6 +41,7 @@ import java.util.Map;
  * If the same metric is created a second time (e.g., a worker task is re-created), the new metric will replace
  * the previous metric in the custom reporter.
  */
+@SuppressWarnings("deprecation")
 public class MockConnectMetrics extends ConnectMetrics {
 
     private static final Map<String, String> DEFAULT_WORKER_CONFIG = new HashMap<>();
@@ -56,12 +58,8 @@ public class MockConnectMetrics extends ConnectMetrics {
         this(new MockTime());
     }
 
-    public MockConnectMetrics(org.apache.kafka.common.utils.MockTime time) {
-        super("mock", new WorkerConfig(WorkerConfig.baseConfigDef(), DEFAULT_WORKER_CONFIG), time);
-    }
-
     public MockConnectMetrics(MockTime time) {
-        super("mock", new WorkerConfig(WorkerConfig.baseConfigDef(), DEFAULT_WORKER_CONFIG), time);
+        super("mock", new WorkerConfig(WorkerConfig.baseConfigDef(), DEFAULT_WORKER_CONFIG), time, "cluster-1");
     }
 
     @Override
@@ -157,6 +155,8 @@ public class MockConnectMetrics extends ConnectMetrics {
     public static class MockMetricsReporter implements MetricsReporter {
         private Map<MetricName, KafkaMetric> metricsByName = new HashMap<>();
 
+        private MetricsContext metricsContext;
+
         public MockMetricsReporter() {
         }
 
@@ -196,6 +196,15 @@ public class MockConnectMetrics extends ConnectMetrics {
         public Object currentMetricValue(MetricName metricName) {
             KafkaMetric metric = metricsByName.get(metricName);
             return metric != null ? metric.metricValue() : null;
+        }
+
+        @Override
+        public void contextChange(MetricsContext metricsContext) {
+            this.metricsContext = metricsContext;
+        }
+
+        public MetricsContext getMetricsContext() {
+            return this.metricsContext;
         }
     }
 }
